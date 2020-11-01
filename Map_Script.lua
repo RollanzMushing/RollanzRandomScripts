@@ -606,6 +606,7 @@ string.ends = oldstring.ends
 local profilePath = getMudletHomeDir()
 profilePath = profilePath:gsub("\\","/")
 
+
 map.defaults = {
     mode = "normal", -- can be simple, normal, or complex
     stretch_map = true,
@@ -614,6 +615,7 @@ map.defaults = {
     speedwalk_wait = true,
     speedwalk_random = true,
     max_search_distance = 1,
+    immediate = true, -- disregard waiting, true by default to replicate previous behaviour
     clear_lines_on_send = true,
     map_window = {x = 0,
         y = 0,
@@ -792,6 +794,38 @@ function map.show_help(cmd)
         end
     end
     echo("\n")
+end
+
+local move_locks = {}
+setmetatable(move_locks, {__mode = "k"})
+
+function map.new_move_locks()
+    move_locks = {}
+    setmetatable(move_locks, {__mode = "k"})
+end
+
+function map.add_lock()
+    local lock = {}
+    move_locks[lock] = true
+    return lock
+end
+
+function map.remove_lock(lock) --removes a specified lock
+  if move_locks[lock] then
+    move_locks[lock] = nil
+    return true --lock found and removed
+  else
+    move_locks[lock] = nil --in case it was false instead of nil, which shouldn't happen
+    return false --lock not found
+  end
+end
+
+function map.temp_timer_lock(time)
+  local lock = map.add_lock()
+  tempTimer(time, function()
+    map.remove_lock(lock) 
+    map.continue_walk()
+  end)
 end
 
 local bool_configs = {'stretch_map', 'search_on_look', 'speedwalk_wait', 'speedwalk_random',
@@ -2090,8 +2124,9 @@ local function handle_exits(exits)
     end
 end
 
-local continue_walk, timerID
-continue_walk = function(new_room)
+
+local expected_room -- put it here so that it is shared across calls to continue_walk
+map.continue_walk = function(new_room) -- no longer local
     if not walking then return end
     -- calculate wait time until next command, with randomness
     local wait = map.configs.speedwalk_delay or 0
@@ -2099,6 +2134,7 @@ continue_walk = function(new_room)
         wait = wait * (1 + math.random(0,100)/100)
     end
     -- if no wait after new room, move immediately
+    --[[
     if new_room and map.configs.speedwalk_wait and wait == 0 then
         new_room = false
     end
@@ -2115,9 +2151,34 @@ continue_walk = function(new_room)
         if timerID then killTimer(timerID) end
         timerID = tempTimer(wait, function() continue_walk() end)
     end
+    ]]
+    
+    if not map.path_routine or coroutine.status(map.path_routine) == "dead" then
+        return
+    end
+    local incr = false --are we in the next room?
+    if not expected_room or not new_room or expected_room == new_room then
+        incr = true
+    end
+    --("<red:green>incr is "..tostring(incr))
+    local err, status, expected_room = coroutine.resume(map.path_routine, false, incr)
+    if err then
+        return -1 --unexpected error
+    elseif not status or status == -1 then
+        return -1 -- also unexpected error
+    elseif status == 0 then
+        return 0 --completed
+    end
+    local wait = map.configs.speedwalk_delay or 0
+    if wait > 0 and map.configs.speedwalk_random then
+        wait = wait * (1 + math.random(0,100))/100
+    end
+    map.temp_timer_lock(wait)
+    return 1
 end
 
 function map.speedwalk(roomID, walkPath, walkDirs)
+    --cecho("<red:green>speedwalk started")
     roomID = roomID or speedWalkPath[#speedWalkPath]
     getPath(map.currentRoom, roomID)
     walkPath = speedWalkPath
@@ -2130,41 +2191,93 @@ function map.speedwalk(roomID, walkPath, walkDirs)
     -- go through dirs to find doors that need opened, etc
     -- add in necessary extra commands to walkDirs table
     local k = 1
-    repeat
+    for k=1, #walkDirs do
         local id, dir = walkPath[k], walkDirs[k]
         if exitmap[dir] or short[dir] then
             local door = check_doors(id, exitmap[dir] or dir)
             local status = door and door[dir]
             if status and status > 1 then
                 -- if locked, unlock door
+                local moveset = {}
+                local k2 = 1
                 if status == 3 then
-                    table.insert(walkPath,k,id)
-                    table.insert(walkDirs,k,"unlock " .. (exitmap[dir] or dir))
-                    k = k + 1
+                    moveset[k2] = "unlock " .. (exitmap[dir] or dir)
+                    k2 = k2 + 1
                 end
                 -- if closed, open door
-                table.insert(walkPath,k,id)
-                table.insert(walkDirs,k,"open " .. (exitmap[dir] or dir))
-                k = k + 1
+                moveset[k2] = "open " .. (exitmap[dir] or dir)
+                k2 = k2 + 1
+                movset[k2] = walkDirs[k]
+                walkDirs[k] = moveset
             end
         end
-        k = k + 1
-    until k > #walkDirs
+    end
     if map.configs.use_translation then
         for k, v in ipairs(walkDirs) do
-            walkDirs[k] = map.configs.lang_dirs[v] or v
+            if type(v) == "string" then
+                walkDirs[k] = map.configs.lang_dirs[v] or v
+            else --type is table
+                for i=1, #v do
+                    v[i] = map.configs.lang_dirs[v[i]] or v[i]
+                end
+            end
         end
     end
     -- perform walk
     walking = true
-    if map.configs.speedwalk_wait or map.configs.speedwalk_delay > 0 then
+    map.new_move_locks() --new path, new locks
+    
+    map.path_routine = coroutine.create(function()
+        local walkPath, walkDirs = walkPath, walkDirs
+        local locks = move_locks
+        local locked
+        local i = 1 --we'll use this counter to traverse the path
+        local stall = 0 --stall detection. Doesn't do anything yet
+                
+        local halt, incr = coroutine.yield() --half specifies whether to end the coroutine early, incr determines whether or not to increment i
+        incr = false
+        repeat
+            if halt then
+                return -1 -- first argument passed is status; -1 indicates the coroutine terminated unexpectedly
+            end
+            locked = false
+            for _,_ in pairs(locks) do
+                locked = true
+                break
+            end
+            if not locked then
+                --cecho("<black:orange>incr is currently: "..tostring(incr))
+                if incr then
+                  i = i + 1
+                  if i > #walkDirs then
+                    break
+                  end
+                end
+                local dir = walkDirs[i]
+                if type(dir) == "string" then
+                    send(dir)
+                elseif type(dir) == "table" then
+                    for i2=1, #dir do
+                        send(dir[i2])
+                    end
+                end
+            end
+            halt, incr = coroutine.yield(true, walkPath[i]) --arguments are coroutine status and expected room number after the move
+            --cecho("<red:blue>current i is: "..tostring(i))
+        until i > #walkDirs
+        return 0 -- 0 indicates coroutine terminated at end of path
+    end
+    )
+    
+    coroutine.resume(map.path_routine) -- this initializes the coroutine (populates the local vars)
+    
+    if map.configs.speedwalk_wait or map.configs.speedwalk_delay > 0 or not map.configs.immediate then
         map.walkDirs = walkDirs
-        continue_walk()
+        map.continue_walk()
     else
-        for _,dir in ipairs(walkDirs) do
-            send(dir)
-        end
-        walking = false
+        repeat
+            coroutine.resume(map.path_routine, false, true)
+        until coroutine.status(map.path_routine) == "dead"
     end
 end
 
@@ -2267,12 +2380,29 @@ function map.sanitizeRoomName(roomtitle)
   return trimmed
 end
 
+function moveRoom()
+  if walking then
+    if map.configs.speedwalk_wait and map.configs.speedwalk_delay > 0 then
+      map.temp_timer_lock(map.configs.speedwalk_delay)
+    end
+  end
+end
+
 function map.eventHandler(event, ...)
     if event == "onNewRoom" then
+        --[[if map.delay and type(map.delay)=="number" and map.delay > 0 then
+            map.temp_timer_lock(map.delay)
+        end]]
         handle_exits(arg[1])
+        if walking then
+            moveRoom()
+            map.continue_walk()
+        end
+        --[[
         if walking and map.configs.speedwalk_wait then
             continue_walk(true)
         end
+        ]]
     elseif event == "onPrompt" then
         if map.prompt.exits and map.prompt.exits ~= "" then
             raiseEvent("onNewRoom")
